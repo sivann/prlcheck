@@ -1,0 +1,212 @@
+#!/usr/bin/env python
+
+import os
+import subprocess
+import json
+import sys
+import re
+import argparse
+import time
+import psutil
+import pprint
+
+
+argparser = argparse.ArgumentParser(description='Process resource limit checker', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+argparser.add_argument('--verbose',  help='Be verbose', action='store_true')
+argparser.add_argument('--threshold', dest='threshold', help='Specify threshold %%',default=80, type=int)
+argparser.add_argument('--ignore', dest='ignore', help='Specify process names to ignore, csv',default='')
+args = argparser.parse_args()
+
+maxint = 9223372036854775807
+
+if len(args.ignore):
+    ignore_list = map(str.strip, args.ignore.split(','))
+else:
+    ignore_list={}
+
+if args.verbose:
+    print('Ignoring: ', ignore_list)
+
+def enc(s):
+    try:
+        r = s.decode('utf-8')
+    except Exception as e:
+        r = s
+    return r
+
+def getProcessLimit(pid,resource):
+    if resource == 'openfiles':
+        cmd="cat /proc/%d/limits |grep 'open files'|awk '{print $(NF-1)}'"%pid
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()[0]
+        p = p.strip()
+        if enc(p) == 'unlimited':
+            return maxint
+        return int(p)
+    elif resource == 'processes':
+        cmd="cat /proc/%d/limits |grep 'Max processes'|awk '{print $(NF-1)}'"%pid
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()[0]
+        p = p.strip()
+        if enc(p) == 'unlimited':
+            return maxint
+        return int(p)
+    elif resource == 'lockedmemory':
+        cmd="cat /proc/%d/limits |grep 'Max locked memory'|awk '{print $(NF-1)}'"%pid
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()[0]
+        p = p.strip()
+        if enc(p) == 'unlimited':
+            return maxint
+        return int(p)
+
+    elif resource == 'stacksize':
+        cmd="cat /proc/%d/limits |grep 'Max stack size'|awk '{print $(NF-1)}'"%pid
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()[0]
+        p = p.strip()
+        if enc(p) == 'unlimited':
+            return maxint
+        return int(p)
+
+    elif resource == 'mapcount':
+        # /proc/sys/vm/max_map_count
+        cmd="sysctl vm.max_map_count|awk '{print $NF}'"
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()[0]
+        p = p.strip()
+        if enc(p) == 'unlimited':
+            return maxint
+        return int(p)
+    else:
+        print('Unknown resource limit type:%s',resource)
+
+def getProcessUsage(pid,resource):
+    try:
+        p = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return -1
+
+    if resource == 'openfiles':
+        return p.num_fds()
+    elif resource == 'processes':
+        return p.num_threads()
+    elif resource == 'lockedmemory':
+        cmd="cat  /proc/%d/status|grep VmLck:|awk '{print $(NF-1)}'"%pid
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()[0]
+        p = p.strip()
+        if p == 'unlimited':
+            return maxint
+        return int(p)
+    elif resource == 'stacksize':
+        cmd="cat  /proc/%d/status|grep VmStk:|awk '{print $(NF-1)}'"%pid
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()[0]
+        p = p.strip()
+        if p == 'unlimited':
+            return maxint
+        return int(p)*1024
+    elif resource == 'mapcount':
+        cmd="cat  /proc/%d/maps|wc -l"%pid
+        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE).communicate()[0]
+        p = p.strip()
+        if p == 'unlimited':
+            return maxint
+        return int(p)
+ 
+    else:
+        print('Unknown resource usage type:%s',resource)
+
+
+def getCmdLine(pid):
+    f = open('/proc/%d/cmdline'%pid)
+    txt = f.read()
+    f.close()
+    return txt.strip()
+
+
+def getData(pids):
+    limits={}
+    usage={}
+    for pid in pids:
+        try:
+            p = psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            #print('WARNING: pid %d does not exist'%pid)
+            continue
+        try:
+            x=p.num_fds()
+        except psutil.AccessDenied:
+            print('ERROR: please run as root')
+            sys.exit(1)
+
+        # kernel threads have no /proc/<pid>/cmdline
+        cmdline = getCmdLine(pid)
+        if not len(cmdline):
+            #print('skipping kernel thread ' +p.name())
+            continue
+
+        if p.name() in ignore_list:
+            if args.verbose:
+                print('Skipping PID %d Name %s in specified ignore list'%(pid, p.name()))
+            continue
+
+
+        limits[pid]={}
+        usage[pid]={}
+
+        usage[pid]['name']=p.name()
+        limits[pid]['openfiles']=getProcessLimit(pid,'openfiles');
+        limits[pid]['processes']=getProcessLimit(pid,'processes');
+        limits[pid]['lockedmemory']=getProcessLimit(pid,'lockedmemory');
+        limits[pid]['stacksize']=getProcessLimit(pid,'stacksize');
+        limits[pid]['mapcount']=getProcessLimit(pid,'mapcount');
+
+        limits[pid]['name']=p.name()
+        usage[pid]['openfiles']=getProcessUsage(pid,'openfiles');
+        usage[pid]['processes']=getProcessUsage(pid,'processes');
+        usage[pid]['lockedmemory']=getProcessUsage(pid,'lockedmemory');
+        usage[pid]['stacksize']=getProcessUsage(pid,'stacksize');
+        usage[pid]['mapcount']=getProcessUsage(pid,'mapcount');
+
+
+        #print p.connections()
+        #print p.open_files()
+    return limits,usage
+
+def showLimitAlerts(pids, limits, usage, threshold, verbose):
+    alerts={}
+    if args.verbose:
+        print('Alert use threshold: %d%%'%(threshold*100))
+        print("%5s | %30s | %15s | %15s | %20s | %5s"% ('PID','NAME','Resource','Usage','Process Limit','Use%'))
+    for pid in limits:
+        for resource in limits[pid]:
+            if resource in ['name']:
+                continue
+            #DEBUG
+            if limits[pid][resource] != 0:
+                use = usage[pid][resource] * 100.0/limits[pid][resource]
+            else:
+                use=0
+
+            if limits[pid][resource] == maxint:
+                _limit='unlimited'
+            else:
+                _limit=str(limits[pid][resource])
+
+            if args.verbose:
+                print("%5d | %30s | %15s | %15d | %20s | %5.2f"% (pid, limits[pid]['name'], resource, usage[pid][resource] , _limit, use))
+            if usage[pid][resource]>0 and (usage[pid][resource] >=  threshold * limits[pid][resource]):
+                if not pid in alerts:
+                    alerts[pid]={}
+                alerts[pid][resource]='PID %d (%s), resource %s : [%d] near or at limit [%s]'%(pid, limits[pid]['name'], resource, usage[pid][resource], _limit) 
+    return alerts
+
+pids = psutil.pids()
+
+limits,usage =getData(pids)
+alerts = showLimitAlerts(pids,limits,usage,args.threshold/100.0, args.verbose)
+
+alert_cnt=0
+for pid in alerts:
+    for alert in alerts[pid]:
+        alert_cnt+=1
+alerts['count']=alert_cnt
+
+if len(alerts):
+    print(json.dumps(alerts))
+
